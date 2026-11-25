@@ -30,11 +30,14 @@ describe('SimulateView', () => {
   const initContract = vi.fn(async () => { await Promise.resolve(); });
   const triggerContract = vi.fn(async () => { await Promise.resolve(); });
   const setLogicTs = vi.fn(async () => { await Promise.resolve(); });
+  const resetExecution = vi.fn();
 
   beforeEach(() => {
     initContract.mockClear();
     triggerContract.mockClear();
+    resetExecution.mockClear();
     setLogicTs.mockClear();
+
     useAppStore.setState({
       modelCto: latePayment.MODEL,
       editorLogicTs: latePayment.LOGIC,
@@ -42,15 +45,26 @@ describe('SimulateView', () => {
       isCompiling: false,
       compilationErrors: [],
       compiledLogicJs: 'compiled',
+
       executionHistory: [initRun, okRun, failedRun],
       executionState: '{"count": 1}',
+
+      // ADD THESE THREE PROPERTIES
+      isTemplateStateful: true,
+      isContractInitialized: true,
+      resetExecution,
+
       isExecuting: false,
       requestJson: JSON.stringify(latePayment.REQUEST, null, 2),
       initContract,
       triggerContract,
       setLogicTs,
     });
-    useDesignV2Store.setState({ view: STEP_ID.simulate, selectedRunId: null });
+
+    useDesignV2Store.setState({
+      view: STEP_ID.simulate,
+      selectedRunId: null
+    });
   });
 
   const runRows = () => within(screen.getByRole('list', { name: SIMULATE.runsLabel })).getAllByRole('button');
@@ -190,13 +204,74 @@ describe('SimulateView', () => {
       });
     });
 
+    it('allows Send for stateless templates without initialization', async () => {
+        useAppStore.setState({
+            isTemplateStateful: false,
+            isContractInitialized: false,
+            executionState: '',
+        });
+
+        render(<SimulateView />);
+
+        const sendButton = screen.getByRole('button', {
+            name: SIMULATE.send
+        });
+
+        expect(sendButton).toBeEnabled();
+
+        fireEvent.click(sendButton);
+
+        await waitFor(() => {
+            expect(triggerContract).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    it('does not show Start Contract for stateless templates', () => {
+        useAppStore.setState({
+            executionHistory: [],
+            executionState: '',
+            isTemplateStateful: false,
+            isContractInitialized: false,
+        });
+
+        render(<SimulateView />);
+
+        expect(
+            screen.getByText(SIMULATE.noRunsStateless)
+        ).toBeInTheDocument();
+
+        expect(
+            screen.queryByRole('button', { name: SIMULATE.init })
+        ).not.toBeInTheDocument();
+    });
+
+    it('confirms before resetting stateless execution', async () => {
+        useAppStore.setState({
+            isTemplateStateful: false,
+            isContractInitialized: false,
+        });
+
+        render(<SimulateView />);
+
+        fireEvent.click(
+            screen.getByRole('button', { name: SIMULATE.restart })
+        );
+
+        expect(resetExecution).not.toHaveBeenCalled();
+        await act(async () => {
+          fireEvent.click(await screen.findByRole('button', { name: SIMULATE.restartConfirm.okText }));
+        });
+        expect(resetExecution).toHaveBeenCalledTimes(1);
+        expect(initContract).not.toHaveBeenCalled();
+    });
+
     it('does not show a dialog', () => {
       render(<SimulateView />);
       noDialog();
     });
 
     it('offers to initialise when there are no runs yet', () => {
-      useAppStore.setState({ executionHistory: [], executionState: '' });
+       useAppStore.setState({executionHistory: [], executionState: '', isTemplateStateful: true, isContractInitialized: false});
       render(<SimulateView />);
       expect(screen.getByText(SIMULATE.noRuns)).toBeInTheDocument();
       expect(screen.getByText(SIMULATE.stats(0, 0, 0))).toBeInTheDocument();
@@ -293,7 +368,7 @@ describe('SimulateView', () => {
     });
 
     it('Send is disabled until the contract is initialised', () => {
-      useAppStore.setState({ executionState: '' });
+      useAppStore.setState({executionState: '', isTemplateStateful: true, isContractInitialized: false,});
       render(<SimulateView />);
       expect(screen.getByRole('button', { name: SIMULATE.send })).toBeDisabled();
     });
@@ -304,9 +379,28 @@ describe('SimulateView', () => {
       expect(useAppStore.getState().requestJson).toBe('{ "invoiceValue": 5 }');
     });
 
-    it('restart re-initialises the contract', () => {
+    it('preserves the runs, state and selection when restart is cancelled', async () => {
+      useDesignV2Store.setState({ selectedRunId: '#1' });
+      const { executionHistory, executionState } = useAppStore.getState();
       render(<SimulateView />);
       fireEvent.click(screen.getByRole('button', { name: SIMULATE.restart }));
+      await act(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: SIMULATE.restartConfirm.cancelText }));
+      });
+      expect(initContract).not.toHaveBeenCalled();
+      expect(useAppStore.getState().executionHistory).toEqual(executionHistory);
+      expect(useAppStore.getState().executionState).toBe(executionState);
+      expect(useDesignV2Store.getState().selectedRunId).toBe('#1');
+    });
+
+    it('confirms before restarting a restored contract with no runs', async () => {
+      useAppStore.setState({ executionHistory: [], isContractInitialized: true });
+      render(<SimulateView />);
+      fireEvent.click(screen.getByRole('button', { name: SIMULATE.restart }));
+      expect(initContract).not.toHaveBeenCalled();
+      await act(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: SIMULATE.restartConfirm.okText }));
+      });
       expect(initContract).toHaveBeenCalledTimes(1);
     });
 
@@ -318,11 +412,12 @@ describe('SimulateView', () => {
       expect(JSON.parse(useAppStore.getState().requestJson)).toEqual(okRun.request);
     });
 
-    it('re-run on the init run initialises again', () => {
+    it('re-run on the init run uses the restart confirmation', async () => {
       useDesignV2Store.setState({ selectedRunId: 'init' });
       render(<SimulateView />);
       fireEvent.click(screen.getByRole('button', { name: SIMULATE.rerun }));
-      expect(initContract).toHaveBeenCalledTimes(1);
+      expect(await screen.findByRole('button', { name: SIMULATE.restartConfirm.cancelText })).toBeInTheDocument();
+      expect(initContract).not.toHaveBeenCalled();
       expect(triggerContract).not.toHaveBeenCalled();
     });
 
